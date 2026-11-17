@@ -1,0 +1,20 @@
+[project]
+name = "comfyui-alchemicmoss"
+description = "The AlchemicaMente line for MOSS-Image: a prompt written by MOSS-Image's own Qwen3.5 encoder, framing and look presets, a KSampler with schedules measured on your checkpoint, and the Calibration that measures it. Installs next to ComfyUI-AlchemicaSampler (Krea 2). Idea: AlchemicaMente · code: Claude (Anthropic)."
+version = "1.0.0"
+license = { file = "LICENSE" }
+readme = "README.md"
+authors = [{ name = "AlchemicaMente" }]
+classifiers = ["Operating System :: OS Independent"]
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/Nessuno76/ComfyUI-AlchemicMoss"
+Documentation = "https://github.com/Nessuno76/ComfyUI-AlchemicMoss#readme"
+"Bug Tracker" = "https://github.com/Nessuno76/ComfyUI-AlchemicMoss/issues"
+
+[tool.comfy]
+PublisherId = "alchemicamente"
+DisplayName = "⚗ AlchemicMoss"
+Icon = "https://raw.githubusercontent.com/Nessuno76/ComfyUI-AlchemicaSampler/main/assets/icon_400.png"
+requires-comfyui = ">=0.42.0"

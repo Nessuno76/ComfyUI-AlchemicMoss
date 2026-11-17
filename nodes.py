@@ -1,0 +1,745 @@
+# ⚗ ComfyUI-AlchemicaSampler — calibrated sampler for Krea 2
+# Copyright (C) 2026 AlchemicaMente — idea, direction and testing
+# Code written by Claude (Anthropic) on AlchemicaMente's design. Thanks to all: see CREDITS.md
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# This program is free software: you can redistribute it and/or modify it under the terms of the
+# GNU General Public License as published by the Free Software Foundation, version 3 (the same
+# license as ComfyUI). It is distributed WITHOUT ANY WARRANTY; see the file LICENSE for details.
+
+import os
+import copy
+import math
+
+import torch
+
+import comfy.model_management
+import comfy.samplers
+
+from .alchemica import pipeline, schedules
+from .alchemica import taratura
+from .alchemica import anteprima
+from .alchemica.plot import plot_curves, plot_sigmas
+from .alchemica.presets import DEFAULTS, DEFAULT_PRESET, PRESETS
+from .alchemica.solvers import solver_names
+
+CAT = "⚗ AlchemicaMente/sampling"
+OPTS = "ALCHEMICA_OPTS"
+UPSCALE = ["bislerp", "bicubic", "bilinear", "nearest-exact", "area"]
+
+
+def _f(default, lo, hi, step=0.01, tip=""):
+    return ("FLOAT", {"default": default, "min": lo, "max": hi, "step": step, "tooltip": tip})
+
+
+def _i(default, lo, hi, tip=""):
+    return ("INT", {"default": default, "min": lo, "max": hi, "tooltip": tip})
+
+
+def _chain(opts, **kw):
+    out = dict(opts) if opts else {}
+    out.update(kw)
+    return (out,)
+
+
+def _resolve(preset, opts):
+    cfg = copy.deepcopy(PRESETS.get(preset, PRESETS[DEFAULT_PRESET]))
+    if opts:
+        cfg.update(opts)
+    for k, v in DEFAULTS.items():
+        cfg.setdefault(k, v)
+    return cfg
+
+
+def _profiles():
+    return ["(auto)", "(nessuno)"] + schedules.profile_names()
+
+
+def _pick_profile(model, profilo):
+    """(auto) = riconosce il checkpoint dall'impronta e usa il suo profilo."""
+    if profilo == "(auto)":
+        imp = taratura.fingerprint(model)
+        imp2 = taratura.fingerprint2(model)
+        lora = taratura.lora_signature(model)
+        info = {}
+        name = schedules.match_profile(imp, lora, imp2, info)
+        if name:
+            print(f"[AlchemicaSampler] automatic profile: '{name}' (fingerprint {imp2 or imp}, {info.get('kind')})")
+            avviso = ""
+            if info.get("kind") == "legacy":
+                avviso = (" [architecture-only fingerprint: check it is the right profile]" if not imp.startswith("v")
+                          else f" [legacy fingerprint shared by {info['legacy']} profiles: if this is the wrong one, pick "
+                               f"the right profile by hand once (it then learns this checkpoint) or re-run the Calibration]"
+                          if info.get("legacy", 0) > 1
+                          else " [old profile: re-run the Calibration to add the v2 fingerprint]")
+            if info.get("provvisorio"):
+                avviso += (f" [PROVISIONAL: only {info.get('campioni', 0)} sample(s), {schedules.MIN_CAMPIONI} needed for "
+                           f"a reliable profile"
+                           + (f"; the older profile '{info['alternativa']}' is reliable: pick it by hand once"
+                              if info.get("alternativa") else "") + "]")
+                print(f"[AlchemicaSampler] WARNING: profile '{name}' is provisional ({info.get('campioni', 0)} samples)")
+            p_lora = (schedules.load_profile(name) or {}).get("lora", "")
+            if lora and p_lora == lora:
+                avviso += " [calibrated with these LoRAs]"
+            elif lora:
+                avviso += " [calibrated WITHOUT these LoRAs: for best accuracy calibrate with the LoRAs connected]"
+            return name, f"automatic profile '{name}'" + avviso
+        print(f"[AlchemicaSampler] no calibrated profile for this model (fingerprint {imp}): "
+              f"run KREA2_TARATURA with this checkpoint")
+        return "", "NO profile for this model: fallback values (run the Calibration)"
+    if profilo.startswith("("):
+        return "", ""
+    if schedules.load_profile(profilo) is None:
+        print(f"[AlchemicaSampler] profile '{profilo}' not found in {schedules.PROFILE_DIR}")
+        return profilo, f"profile '{profilo}' NOT FOUND"
+    nota = f"profile '{profilo}'"
+    if not (schedules.load_profile(profilo) or {}).get("impronta2"):
+        # an older profile picked by hand: if it belongs to this checkpoint's 1.0 group, teach it the v2 fingerprint
+        if schedules.stamp_profile(profilo, taratura.fingerprint(model), taratura.fingerprint2(model)):
+            nota += " [now recognised automatically for this checkpoint]"
+            print(f"[AlchemicaSampler] profile '{profilo}' learned this checkpoint's fingerprint v2")
+    return profilo, nota
+
+
+_OPT_IN = {"optional": {"opts": (OPTS, {"tooltip": "Chain from another Alchemica options node"})}}
+
+
+# =============================================================== nodo principale
+
+class AlchemicaSampler:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "positive": ("CONDITIONING",),
+                "latent_image": ("LATENT", {"tooltip": "Latent at the FINAL resolution. In two-stage mode the first stage works at a fraction of it."}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF, "control_after_generate": True}),
+                "preset": (list(PRESETS.keys()), {"default": DEFAULT_PRESET}),
+                "profilo": (_profiles(), {"tooltip": "(auto) = recognises the checkpoint and uses its calibration profile. Needed by the foto_tarata presets and by -1 values"}),
+                "denoise": _f(1.0, 0.0, 1.0, 0.01, "1.0 = from scratch. <1 = img2img (disables two-stage mode)."),
+            },
+            "optional": {
+                "negative": ("CONDITIONING", {"tooltip": "Used only with negative_mode = text and cfg > 1"}),
+                "modello_rifinitura": ("MODEL", {"tooltip": "Optional: second stage with a different model"}),
+                "opts": (OPTS, {"tooltip": "Overrides the preset entries"}),
+                **anteprima.ingressi(),
+            },
+        }
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, profilo=None, **kw):
+        # il menu dei profili viene costruito all'avvio: accetta anche un nome
+        # salvato nel workflow e non ancora in elenco (basta che il file esista)
+        return True
+
+    RETURN_TYPES = ("LATENT", "SIGMAS", "IMAGE", "STRING", "IMAGE")
+    RETURN_NAMES = ("latent", "sigmas", "grafico_sigma", "report", "immagine")
+    OUTPUT_NODE = True   # like the Efficiency KSampler: with a VAE it shows the image even with nothing after it
+    FUNCTION = "sample"
+    CATEGORY = CAT
+    DESCRIPTION = "Modular sampler for Krea 2 Turbo: presets + chainable options, two stages low -> high resolution."
+
+    def sample(self, model, positive, latent_image, seed, preset, profilo, denoise, negative=None, opts=None,
+               modello_rifinitura=None, vae=None, preview_method=anteprima.METODO_DEFAULT, degrid=0.0, **ignorati):
+        if ignorati:
+            print(f"[AlchemicaSampler] ingressi non riconosciuti: {list(ignorati)} — "
+                  f"riavvia il server di ComfyUI, non basta ricaricare la pagina")
+        cfg = _resolve(preset, opts)
+        cfg["profilo"], nota = _pick_profile(model, profilo)
+        with anteprima.metodo(preview_method):
+            out, sig, report, plots = pipeline.run(model, positive, negative, latent_image, seed, cfg, denoise,
+                                                   model2=modello_rifinitura)
+        title = f"AlchemicaSampler | {preset} | {cfg['scheduler']} + {cfg['solver']}" + (f" | {nota}" if nota else "")
+        img = plot_sigmas(plots, title) if plots else torch.zeros(1, 64, 64, 3)
+        text = "\n".join([title] + report)
+        print("[AlchemicaSampler]\n" + text)
+        return anteprima.risultato((out, sig, img, text), vae, out, degrid)
+
+
+# =============================================================== nodi opzione
+
+class AlchemicaScheduleOpts:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "scheduler": (schedules.scheduler_names(), {"default": "alchemica_duale"}),
+            "steps": _i(8, 1, 200, "Total steps (single stage)"),
+            "duale_alto": _f(1.0, 0.0, 20.0, 0.05, "alchemica_duale: extra steps on composition (high sigma)"),
+            "duale_ampiezza_alto": _f(0.10, 0.01, 1.0, 0.01, "alchemica_duale: how far the high lobe reaches down"),
+            "duale_basso": _f(8.0, 0.0, 40.0, 0.1, "alchemica_duale: extra steps on the final detail (low sigma)"),
+            "duale_ampiezza_basso": _f(0.08, 0.01, 1.0, 0.01, "alchemica_duale: how far the low lobe reaches up"),
+            "tarato_esponente": _f(0.5, 0.0, 1.5, 0.05, "alchemica_tarato: 0.5 = theoretical optimum for euler. Higher = more steps where the model changes most"),
+            "tarato_miscela": _f(0.15, 0.0, 1.0, 0.01, "alchemica_tarato: share of steps spread uniformly"),
+            "shift_override": _f(0.0, 0.0, 5.0, 0.01, "Shift mu (0 = the model's own, 1.15 for Krea 2)"),
+            "flux_q": _f(1.0, 0.3, 3.0, 0.05, "flux_shift: >1 more steps at the top, <1 at the bottom"),
+            "plunge_sigma": _f(0.0, 0.0, 0.95, 0.01, "0 = off. Otherwise structure stops here and the last step jumps to 0"),
+            "calibrated_v2": ("BOOLEAN", {"default": False, "tooltip": "alchemica_tarato v2: step law matched to the "
+                              "solver order (cube root of the 3rd derivative for euler_2m / heun), smoothing in log-SNR, "
+                              "and stage 1 of two stages uses the curves measured at half resolution. Needs a profile "
+                              "calibrated after 2026-10-10 for the new curves (otherwise only the smoothing applies)"}),
+        }, **_OPT_IN}
+
+    RETURN_TYPES = (OPTS,)
+    FUNCTION = "build"
+    CATEGORY = CAT
+
+    def build(self, opts=None, calibrated_v2=False, **kw):
+        return _chain(opts, tarato_v2=bool(calibrated_v2), **kw)
+
+
+class AlchemicaDetailOpts:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "solver": (solver_names(), {"default": "euler"}),
+            "detail_amount": _f(0.3, -1.0, 1.0, 0.01, "Detail boost (0 = off, negative = softer)"),
+            "detail_start": _f(0.15, 0.0, 1.0, 0.01, "Fraction of the trajectory where it starts"),
+            "detail_end": _f(0.95, 0.0, 1.0, 0.01, "Fraction of the trajectory where it ends"),
+            "detail_peak": _f(0.6, 0.05, 0.95, 0.01, "Where it peaks"),
+            "detail_sigma_hi": _f(0.0, -1.0, 1.0, 0.01, "Sigma window: start. 0 = use detail_start/end, -1 = from the profile"),
+            "detail_sigma_lo": _f(0.0, -1.0, 1.0, 0.01, "Sigma window: end. 0 = use detail_start/end, -1 = from the profile"),
+            "eta": _f(0.5, 0.0, 1.5, 0.05, "Ancestral noise at high sigma (variety/texture). 0 = deterministic"),
+            "sigma_gate": _f(0.65, 0.0, 1.0, 0.01, "Below this sigma eta = 0. Keep this at or above the profile's detail_sigma_hi, or eta reinjects noise while skin/fabric detail is forming (wet-look artifacts)"),
+            "gate_hi": _f(0.85, 0.0, 1.0, 0.01, "Above this sigma eta is at full strength (pure composition phase)"),
+            "contraction": _f(0.85, 0.3, 1.2, 0.01, "Scale of the initial noise. 1 = standard"),
+        }, **_OPT_IN}
+
+    RETURN_TYPES = (OPTS,)
+    FUNCTION = "build"
+    CATEGORY = CAT
+
+    def build(self, opts=None, **kw):
+        return _chain(opts, **kw)
+
+
+class AlchemicaRestartOpts:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "restart_steps": _i(2, 0, 20, "0 = off. Extra steps after the restart"),
+            "restart_sigma": _f(0.5, -1.0, 0.95, 0.01, "How high it re-noises. -1 = from the profile (where half of the detail is born)"),
+        }, **_OPT_IN}
+
+    RETURN_TYPES = (OPTS,)
+    FUNCTION = "build"
+    CATEGORY = CAT
+
+    def build(self, opts=None, **kw):
+        return _chain(opts, **kw)
+
+
+class AlchemicaGuidanceOpts:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "cfg_base": _f(1.0, 0.0, 20.0, 0.05, "CFG at low sigma (1.0 for Turbo)"),
+            "cfg_peak": _f(1.0, 0.0, 20.0, 0.05, "CFG at high sigma (composition). Equal to base = constant"),
+            "cfg_lo": _f(0.7, 0.0, 1.0, 0.01, "Below this sigma: cfg_base"),
+            "cfg_hi": _f(0.9, 0.0, 1.0, 0.01, "Above this sigma: cfg_peak"),
+            "negative_mode": (["zero", "text"], {"default": "zero", "tooltip": "zero = zeroed negative (Turbo). text = uses the connected negative"}),
+        }, **_OPT_IN}
+
+    RETURN_TYPES = (OPTS,)
+    FUNCTION = "build"
+    CATEGORY = CAT
+
+    def build(self, opts=None, **kw):
+        return _chain(opts, **kw)
+
+
+class AlchemicaTwoStageOpts:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "two_stage": ("BOOLEAN", {"default": True}),
+            "stage1_scale": _f(0.5, 0.25, 1.0, 0.05, "First-stage side relative to the final one (0.5 = 1/4 of the pixels)"),
+            "stage1_steps": _i(5, 1, 50, "Composition steps above the hand-off sigma"),
+            "handoff_sigma": _f(0.65, -1.0, 0.95, 0.01, "Hand-off sigma. -1 = from the profile (composition 98.5% locked)"),
+            "stage2_steps": _i(6, 1, 50, "High-resolution refinement steps"),
+            "stage2_scheduler": (["same"] + schedules.scheduler_names(), {"default": "same"}),
+            "upscale_method": (UPSCALE, {"default": "bislerp"}),
+            "stage2_seed_offset": _i(1, 0, 1000, "Second-stage noise uses seed + offset"),
+            "handoff_k": _f(1.0, 0.0, 4.0, 0.05, "Resolution correction of the hand-off. 1 = off (1.0 behaviour). "
+                            "0 = auto: stage 1 stops at the half-resolution sigma EQUIVALENT to the hand-off at full "
+                            "resolution (SD3 rule, k = 1/stage1_scale). >1 = explicit factor"),
+            "lowfreq_anchor": _f(0.0, 0.0, 1.0, 0.05, "Stage 2 keeps the LOW frequencies (composition, colour) of the "
+                                 "upscaled stage-1 image, fading out as sigma falls (HiFlow). 0 = off, 1 = full. "
+                                 "Only with alchemica_* solvers"),
+            "lowfreq_cutoff": _f(0.125, 0.02, 0.6, 0.005, "Low-frequency anchor: highest frequency kept from stage 1 "
+                                 "(normalised; 0.125 = 8x8 latent blocks, the scale where the Calibration measures the "
+                                 "composition). Higher = more of the stage-1 image kept (blurrier)"),
+        }, **_OPT_IN}
+
+    RETURN_TYPES = (OPTS,)
+    FUNCTION = "build"
+    CATEGORY = CAT
+
+    def build(self, opts=None, lowfreq_anchor=0.0, lowfreq_cutoff=0.125, **kw):
+        return _chain(opts, ancora_forza=float(lowfreq_anchor), ancora_d=float(lowfreq_cutoff), **kw)
+
+
+# =============================================================== componenti per SamplerCustom
+
+class AlchemicaSigmas:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"model": ("MODEL",), "preset": (list(PRESETS.keys()), {"default": DEFAULT_PRESET}),
+                             "profilo": (_profiles(),), "denoise": _f(1.0, 0.0, 1.0)}, **_OPT_IN}
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, profilo=None, **kw):
+        # il menu dei profili viene costruito all'avvio: accetta anche un nome
+        # salvato nel workflow e non ancora in elenco (basta che il file esista)
+        return True
+
+    RETURN_TYPES = ("SIGMAS", "IMAGE")
+    FUNCTION = "build"
+    CATEGORY = CAT
+    DESCRIPTION = "The sigmas of a preset (single stage) for SamplerCustom / SamplerCustomAdvanced."
+
+    def build(self, model, preset, profilo, denoise, opts=None):
+        cfg = _resolve(preset, opts)
+        cfg["profilo"], _ = _pick_profile(model, profilo)
+        cfg, _ = pipeline.resolve_auto(cfg)
+        sig = schedules.main_schedule(model.get_model_object("model_sampling"), cfg, denoise)
+        return (sig, plot_sigmas([(cfg["scheduler"], sig)], f"AlchemicaSigmas | {preset}"))
+
+
+class AlchemicaSamplerObject:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"preset": (list(PRESETS.keys()), {"default": DEFAULT_PRESET}),
+                             "profilo": (_profiles(),),
+                             "noise_seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF, "control_after_generate": True})}, **_OPT_IN}
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, profilo=None, **kw):
+        # il menu dei profili viene costruito all'avvio: accetta anche un nome
+        # salvato nel workflow e non ancora in elenco (basta che il file esista)
+        return True
+
+    RETURN_TYPES = ("SAMPLER",)
+    FUNCTION = "build"
+    CATEGORY = CAT
+    DESCRIPTION = "The Alchemica loop (solver + detail + eta + restart) as a SAMPLER for SamplerCustom."
+
+    def build(self, preset, profilo, noise_seed, opts=None):
+        cfg = _resolve(preset, opts)
+        cfg["profilo"] = "" if profilo.startswith("(") else profilo
+        cfg, _ = pipeline.resolve_auto(cfg)
+        return (pipeline.make_sampler(cfg, noise_seed),)
+
+
+# =============================================================== risoluzione
+
+ASPECTS = {"1:1": (1, 1), "2:3": (2, 3), "3:2": (3, 2), "3:4": (3, 4), "4:3": (4, 3),
+           "4:5": (4, 5), "5:4": (5, 4), "9:16": (9, 16), "16:9": (16, 9), "21:9": (21, 9)}
+
+
+class AlchemicaResolution:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "aspect": (list(ASPECTS.keys()), {"default": "2:3"}),
+            "megapixels": _f(2.5, 0.25, 8.0, 0.05, "FINAL resolution"),
+            "batch_size": _i(1, 1, 16),
+        }}
+
+    RETURN_TYPES = ("LATENT", "INT", "INT")
+    RETURN_NAMES = ("latent", "width", "height")
+    FUNCTION = "build"
+    CATEGORY = CAT
+    DESCRIPTION = "Empty Krea 2 latent (16-channel Wan21) with sides that are multiples of 16."
+
+    def build(self, aspect, megapixels, batch_size):
+        a, b = ASPECTS[aspect]
+        s = math.sqrt(megapixels * 1024 * 1024 / (a * b))
+        w = max(256, int(round(a * s / 16)) * 16)
+        h = max(256, int(round(b * s / 16)) * 16)
+        lat = torch.zeros([batch_size, 16, h // 8, w // 8], device=comfy.model_management.intermediate_device())
+        return ({"samples": lat}, w, h)
+
+
+
+
+# =============================================================== taratura
+
+def nome_profilo_auto(model, latent):
+    """Profile name from what is calibrated: the checkpoint file (+ the LoRA stack), e.g. myFinetune_v6INT8.
+    ONE profile per model, valid at every resolution: Krea 2 uses a fixed shift (1.15) and the measured step density
+    barely moves with the size (a fine-tuned Krea 2, 6.3 MP vs 1.6 MP: 8-step schedules within 0.008 sigma, curves
+    correlated 0.988), so runs at different resolutions can be averaged in the same profile."""
+    import os
+    nome = ""
+    init = getattr(model, "cached_patcher_init", None)       # set by ComfyUI's loaders, kept by clone()
+    try:
+        arg = init[1][0] if init else ""
+        if isinstance(arg, (list, tuple)):
+            arg = arg[0] if arg else ""
+        if isinstance(arg, str) and arg:
+            nome = os.path.splitext(os.path.basename(arg))[0]
+    except Exception:
+        nome = ""
+    if not nome:
+        nome = "model_" + str(taratura.fingerprint2(model) or taratura.fingerprint(model) or "x")[:10]
+    out = nome
+    lora = taratura.lora_signature(model)
+    if lora:
+        out += "_" + lora
+    return "".join(ch for ch in out if ch.isalnum() or ch in "-_.")
+
+
+class AlchemicaTaratura:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "model": ("MODEL", {"tooltip": "The model to calibrate (e.g. Krea 2 Turbo NVFP4)"}),
+            "positive": ("CONDITIONING",),
+            "latent_image": ("LATENT", {"tooltip": "At the resolution you really generate at (the FINAL one)"}),
+            "seed": ("INT", {"default": 1001, "min": 0, "max": 0xFFFFFFFFFFFFFFFF, "control_after_generate": True}),
+            "passi_densi": _i(40, 16, 120, "Steps of the measuring trajectory. 40 is enough, 60 is more precise"),
+            "cfg": _f(1.0, 0.0, 10.0, 0.05, "As you will use it (Turbo: 1.0)"),
+            "profilo": ("STRING", {"default": "(auto)", "tooltip": "(auto) = named after the checkpoint file (plus "
+                                   "the LoRA stack if one is connected), e.g. myFinetune_v6INT8: one profile per "
+                                   "model, valid at every resolution. Or write a name (file name inside profili/)"}),
+            "modalita": (["accumula", "sostituisci"], {"default": "accumula", "tooltip": "accumula (accumulate) = averages with the other prompts; re-running the same prompt UPDATES its sample instead of adding one. sostituisci (replace) = start from scratch"}),
+            "sonda_eta": _f(0.5, 0.0, 1.0, 0.05, "Probe intensity ONLY for measuring eta/detail-boost tolerance (eta_sicuro/detail_sicuro) - not the eta you will generate with"),
+            "measure_half_res": ("BOOLEAN", {"default": True, "tooltip": "Also measures at HALF resolution (+~30% time): "
+                                 "stage 1 of two-stage sampling then gets its own step spacing (calibration v2)"}),
+        }, "optional": {
+            "modello_riferimento": ("MODEL", {"tooltip": "Optional: e.g. Krea 2 FP8, to measure the error introduced by NVFP4 quantization"}),
+            "negative": ("CONDITIONING", {"tooltip": "Optional: the negative you generate with. Needed when cfg > 1 "
+                         "(MOSS-Image: cfg 2.5 + its negative). Empty = an all-zero negative, right for Krea 2 at cfg 1"}),
+        }}
+
+    RETURN_TYPES = ("LATENT", "IMAGE", "STRING")
+    RETURN_NAMES = ("latent_riferimento", "grafico", "report")
+    FUNCTION = "run"
+    OUTPUT_NODE = True
+    CATEGORY = CAT
+    DESCRIPTION = "Measures how the model builds the image and saves a profile for the alchemica_tarato scheduler."
+
+    @classmethod
+    def IS_CHANGED(cls, **kw):
+        # 2026-10-19: always run. With unchanged inputs (prompt line and seed on 'fixed') ComfyUI used to serve the
+        # cached result: 16 queued runs ended in seconds and the profile kept 1 sample (a fine-tune profile)
+        return float("nan")
+
+    def run(self, model, positive, latent_image, seed, passi_densi, cfg, profilo, modalita, sonda_eta=0.5,
+            measure_half_res=True, modello_riferimento=None, negative=None):
+        auto = profilo.strip().lower() in ("", "(auto)", "auto")
+        name = nome_profilo_auto(model, latent_image) if auto else \
+            ("".join(ch for ch in profilo.strip() if ch.isalnum() or ch in "-_.") or "profilo")
+        out, prof, rows, t = taratura.run_calibration(model, positive, latent_image, seed, passi_densi, cfg,
+                                                      name, modalita, modello_riferimento, sonda_eta,
+                                                      bool(measure_half_res), negative)
+        ms = model.get_model_object("model_sampling")
+        c = dict(DEFAULTS, profilo=name)
+        s8 = schedules.base_schedule(ms, "alchemica_tarato", 8, c)
+        s12 = schedules.base_schedule(ms, "alchemica_tarato", 12, c)
+        sd = schedules.base_schedule(ms, "alchemica_duale", 8, c)
+        sig = prof["sigma"]
+        cost = prof["costo"]
+        dens = [v ** 0.5 for v in cost]
+        mx = max(dens) or 1.0
+        series = [("densita' step", sig, [d / mx for d in dens], 1.0),
+                  ("composizione", sig, prof["comp"], 1.0),
+                  ("dettaglio", sig, [max(0.0, v) for v in prof["dett"]], 1.0),
+                  ("HF energy", sig, prof["energia"], max(1.0, max(prof["energia"])))]
+        if prof.get("costo3"):
+            d3 = [v ** (1.0 / 3.0) for v in prof["costo3"]]
+            m3 = max(d3) or 1.0
+            series.append(("2nd-order density", sig, [v / m3 for v in d3], 1.0))
+        if "quant" in prof:
+            series.append(("NVFP4 error x5", sig, [5 * v for v in prof["quant"]], 1.0))
+        try:      # 2026-10-19: the explained chart (phases, every sample, where the steps go, in words)
+            from .alchemica.grafico_taratura import disegna
+            img = disegna(prof, name, taratura.recommendations, s8.tolist(),
+                          schedules.base_schedule(ms, "flux_shift", 8, c).tolist(), schedules.MIN_CAMPIONI)
+        except Exception as ex:
+            print(f"[AlchemicaTaratura] explained chart failed ({ex}): plain curves")
+            img = plot_curves(series, f"Calibration '{name}'  samples: {prof['campioni']}",
+                              [("tar 8", s8), ("tar 12", s12), ("duale8", sd)])
+        k = prof["consigli"]
+        d = prof["diagnostica"]
+        f = lambda v: "n/a" if v is None else f"{v:.3f}"
+        lines = [
+            f"PROFILE '{name}'{' (automatic name)' if auto else ''}  samples {prof['campioni']} (distinct prompts)  "
+            f"resolutions {', '.join(prof['risoluzioni'])}  ({t:.1f}s this run)  fingerprint {prof.get('impronta2') or prof.get('impronta', '?')}",
+            f"composition locked: 95% at sigma {f(k['composizione_bloccata_95'])}, 98.5% at {f(k['composizione_bloccata_985'])}",
+            f"detail structure (where): 10% {f(k['struttura_10'])}, 50% {f(k['struttura_50'])}, 90% {f(k['struttura_90'])}",
+            f"sharpness (how much): 10% {f(k['nitidezza_10'])}, 50% {f(k['nitidezza_50'])}, 90% {f(k['nitidezza_90'])}  (plateau {k['plateau_energia']})",
+            f"-> handoff_sigma {k['handoff_sigma']}  restart_sigma {k['restart_sigma']}  detail window {k['detail_sigma_hi']} -> {k['detail_sigma_lo']}",
+            f"eta/detail sensitivity (probe {float(sonda_eta):.2f}): composition (sigma>=0.6) diverges {f(k.get('comp_div_alta'))}, "
+            f"detail (sigma<0.6) diverges {f(k.get('dett_div_bassa'))}  -> eta_sicuro {k.get('eta_sicuro', 0.0):.2f}  detail_sicuro {k.get('detail_sicuro', 0.0):.3f}",
+            f"difficulty (compare only with other profiles calibrated with this same measure; it is not a step count): {k.get('difficolta', 0.0):.3f}",
+            "calibrated 8 steps : " + " ".join(f"{v:.3f}" for v in s8.tolist()),
+            "calibrated 12 steps: " + " ".join(f"{v:.3f}" for v in s12.tolist()),
+            f"calibration v2: samples with a 2nd-order curve {prof.get('campioni_v2', 0)}/{prof['campioni']}, "
+            f"at half resolution {prof.get('campioni_bassa', 0)}/{prof['campioni']}"
+            + (f" ({', '.join(prof.get('risoluzioni_bassa', []))})" if prof.get('risoluzioni_bassa') else "")
+            + f"  LoRA: {'signature ' + prof['lora'] if prof.get('lora') else 'none'}",
+            "v2 euler_2m 8 steps: " + " ".join(f"{v:.3f}" for v in schedules.base_schedule(
+                ms, "alchemica_tarato", 8, dict(c, tarato_v2=True, solver="euler_2m")).tolist()),
+            "tip: for a reliable profile calibrate 16 or more different prompts in 'accumulate' mode "
+            "(es. ⚗ Alchemica Prompt in 'from list' con line in increment, coda di N esecuzioni)",
+            f"GPU {d.get('gpu')}  cc {d.get('capability', 'n/a')}  torch {d['torch']}  CUDA {d['cuda']}",
+            f"weights: {d.get('pesi')}",
+        ] + [f"WARNING: {w}" for w in d.get("avvisi", [])] + [f"WARNING: {w}" for w in prof.get("avvisi_ultima", [])]
+        if schedules.affidabile(prof):
+            lines.insert(1, f"RELIABLE PROFILE ({prof['campioni']} samples): (auto) in the ⚗ samplers uses it for this "
+                            f"checkpoint. More runs keep refining it; nothing else to do")
+        if not schedules.affidabile(prof):
+            lines.insert(1, f"PROVISIONAL PROFILE: {prof['campioni']}/{schedules.MIN_CAMPIONI} samples. (auto) will "
+                            f"prefer a reliable profile of this checkpoint until this one reaches {schedules.MIN_CAMPIONI}. "
+                            f"Queue more runs with DIFFERENT prompts (Prompt 'from list', line on increment)")
+        if negative is None and float(cfg) > 1.0:
+            lines.append(f"WARNING: cfg {float(cfg):g} with no negative connected: measured against an all-zero negative. "
+                         f"Connect the negative you generate with (MOSS-Image: its written negative)")
+        if passi_densi < 24:
+            lines.append(f"WARNING: passi_densi={passi_densi} is low for a reliable sensitivity measurement (40-60 recommended); "
+                        f"eta_sicuro/detail_sicuro may not have been measured or may be noisy.")
+        if k.get("comp_div_alta") is None and k.get("dett_div_bassa") is None:
+            lines.append("sensitivity NOT measured (dense trajectory too short or error in the probe step): "
+                        "eta_sicuro/detail_sicuro are at the fallback value 0.0, do not raise them without checking by hand.")
+        if "quant" in prof:
+            qi = max(range(len(sig)), key=lambda i: prof["quant"][i])
+            lines.append(f"NVFP4 error vs reference: mean {sum(prof['quant']) / len(sig):.3f}, max {prof['quant'][qi]:.3f} at sigma {sig[qi]:.2f}")
+        text = "\n".join(lines)
+        print("[AlchemicaTaratura]\n" + text)
+        return {"ui": {"text": [text]}, "result": (out, img, text)}
+
+
+# =============================================================== nodo unico (semplice)
+
+MODI = {
+    # modo: (stage1_steps, stage2_steps, steps_stadio_unico, restart_steps, solver)
+    "veloce":            (3, 6, 8, 0, "euler"),
+    "equilibrato":       (4, 8, 10, 2, "euler_2m"),
+    "massimo dettaglio": (5, 12, 14, 3, "euler_2m"),
+}
+
+
+class AlchemicaKrea:
+    """Tutto quello che serve in un nodo solo. I parametri fini stanno nei preset e
+    nel profilo di taratura; qui restano le manopole che cambiano davvero l'immagine."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "positive": ("CONDITIONING",),
+                "latent_image": ("LATENT", {"tooltip": "At the final resolution (⚗ Resolution node)"}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF, "control_after_generate": True}),
+                "profilo": (_profiles(), {"tooltip": "(auto) recognises the model and uses its calibration profile"}),
+                "modo": (list(MODI.keys()), {"default": "equilibrato",
+                         "tooltip": "How many steps: veloce (fast) ~30 s, equilibrato (balanced) ~45 s, massimo dettaglio (max detail) ~70 s at 3 MP"}),
+                "due_stadi": ("BOOLEAN", {"default": True,
+                              "tooltip": "Composes at half resolution and refines at full resolution. Required above ~1.5 MP"}),
+                "ridisegno": _f(-1.0, -1.0, 0.95, 0.01,
+                                "How freely the second stage may redraw. -1 = from the profile (recommended). Higher = more new detail, but the composition may change"),
+                "dettaglio": _f(0.12, 0.0, 0.25, 0.01,
+                                "Micro-relief of skin and fabric. 0.12 is the validated value; above 0.2 coloured speckles come back"),
+                "varieta": _f(0.6, 0.0, 1.2, 0.05,
+                              "Ancestral noise: texture and seed-to-seed variety. 0 = deterministic. "
+                              "2026-10-05: on checkpoint+LoRA combos with a strong LoRA, above ~0.3 this can produce "
+                              "wet-skin/droplet artifacts ('gocce') regardless of where it's gated — if you see that, "
+                              "lower this to 0.15-0.2 first (confirmed clean at 0.15 on a fine-tuned checkpoint with a strong LoRA at x2)"),
+                "denoise": _f(1.0, 0.0, 1.0, 0.01, "1.0 = from scratch. <1 = img2img (disables two-stage mode)"),
+                "contraction": _f(0.85, 0.3, 1.2, 0.01,
+                                  "Scale of the initial noise. 1 = standard ComfyUI noise. 2026-10-05: NOT a cause of "
+                                  "'gocce' by itself (tested at 1.0 with eta 0.6: gocce unchanged), but at LOW varieta "
+                                  "(~0.3) the default 0.85 is measurably cleaner than 1.0 — leave at 0.85 unless you "
+                                  "have a specific reason to change it"),
+                "steps": _i(-1, -1, 50,
+                            "Step override. -1 = from 'modo'. Single-stage: total steps. Two-stage: overrides only "
+                            "stage 2 (refinement); stage 1 stays tied to the calibration profile"),
+                "cfg": _f(-1.0, -1.0, 20.0, 0.05,
+                          "CFG override, flat (no high/low schedule). -1 = 1.0 (Turbo default: negative skipped, 0 extra cost)"),
+            },
+            "optional": {
+                "negative": ("CONDITIONING", {"tooltip": "Used only if you set cfg > 1"}),
+                "modello_rifinitura": ("MODEL", {"tooltip": "Optional: composes with the main model and REFINES with this one (e.g. anatomy from a fine-tune, skin from base Krea 2). Requires two-stage mode"}),
+                "opts": (OPTS, {"tooltip": "For tinkerers: overrides everything with the option nodes (including contraction/steps/cfg set here)"}),
+                **anteprima.ingressi(),
+            },
+        }
+
+    RETURN_TYPES = ("LATENT", "IMAGE", "STRING", "IMAGE")
+    RETURN_NAMES = ("latent", "grafico_sigma", "report", "immagine")
+    OUTPUT_NODE = True   # like the Efficiency KSampler: with a VAE it shows the image even with nothing after it
+    FUNCTION = "sample"
+    CATEGORY = CAT
+    DESCRIPTION = "AlchemicaSampler in a single node: the knobs that matter, the rest from the calibration profile."
+
+    def sample(self, model, positive, latent_image, seed, profilo, modo, due_stadi,
+               ridisegno, dettaglio, varieta, denoise, contraction=0.85, steps=-1, cfg=-1.0,
+               negative=None, opts=None, modello_rifinitura=None,
+               vae=None, preview_method=anteprima.METODO_DEFAULT, degrid=0.0, **ignorati):
+        # **ignorati: se il workflow e' piu' recente del codice caricato, il nodo avvisa
+        # invece di bloccare tutto (ComfyUI non ricarica i moduli senza riavvio del server)
+        if ignorati:
+            print(f"[AlchemicaKrea] ingressi non riconosciuti: {list(ignorati)} — "
+                  f"riavvia il server di ComfyUI, non basta ricaricare la pagina")
+        if float(denoise) <= 0:  # nothing to redraw (e.g. the second pass of Body Guide when the guide is off)
+            vuota = torch.zeros(1, 8, 8, 3)
+            return (latent_image, vuota, "denoise 0: latent passed through", vuota)
+        s1, s2, uno, restart, solver = MODI[modo]
+        cfg_dict = copy.deepcopy(PRESETS["foto_tarata_2K"])
+        cfg_dict.update({
+            "solver": solver, "two_stage": bool(due_stadi),
+            "stage1_steps": s1, "stage2_steps": s2, "steps": uno,
+            "restart_steps": restart, "restart_sigma": -1,
+            "handoff_sigma": float(ridisegno),
+            "detail_amount": float(dettaglio), "detail_sigma_hi": -1, "detail_sigma_lo": -1,
+            "eta": float(varieta), "contraction": float(contraction),
+        })
+        if int(steps) >= 1:
+            if due_stadi:
+                cfg_dict["stage2_steps"] = int(steps)
+            else:
+                cfg_dict["steps"] = int(steps)
+        if float(cfg) >= 0.0:
+            cfg_dict["cfg_base"] = cfg_dict["cfg_peak"] = float(cfg)
+        if opts:
+            cfg_dict.update(opts)
+        cfg = cfg_dict
+        cfg["profilo"], nota = _pick_profile(model, profilo)
+        with anteprima.metodo(preview_method):
+            out, sig, report, plots = pipeline.run(model, positive, negative, latent_image, seed, cfg, denoise,
+                                                   model2=modello_rifinitura)
+        title = f"AlchemicaKrea | {modo} | {'two stages' if due_stadi else 'single stage'}" + (f" | {nota}" if nota else "")
+        img = plot_sigmas(plots, title) if plots else torch.zeros(1, 64, 64, 3)
+        text = "\n".join([title] + report)
+        print("[AlchemicaKrea]\n" + text)
+        return anteprima.risultato((out, img, text), vae, out, degrid)
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, profilo=None, **kw):
+        return True
+
+
+# =============================================================== LoRA
+
+SLOT_LORA = 6
+
+
+def _lore():
+    try:
+        import folder_paths
+        return ["(nessuna)"] + folder_paths.get_filename_list("loras")
+    except Exception:
+        return ["(nessuna)"]
+
+
+class _Qualsiasi(str):
+    """Tipo jolly '*': ComfyUI lo accetta verso qualunque ingresso (serve ai connettori di passaggio)."""
+    def __ne__(self, altro):
+        return False
+
+
+QUALSIASI = _Qualsiasi("*")
+PASSA_MAX = 8   # connettori di passaggio: l'interfaccia (web/alchemica_passa.js) ne mostra uno libero alla volta
+
+
+class AlchemicaLoraStack:
+    """Fino a 6 LoRA in un nodo solo, applicate in ordine. Nessuna dipendenza esterna.
+    Si concatena: l'uscita MODEL di uno entra nell'ingresso model del successivo.
+    Connettori di PASSAGGIO (passa_1..8): qualunque cosa entra esce uguale (es. il VAE dal loader), solo per
+    tenere ordinati i cavi. Quando colleghi l'ultimo libero ne compare uno nuovo."""
+
+    _cache = {}
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        req = {"model": ("MODEL",)}
+        for i in range(1, SLOT_LORA + 1):
+            req[f"lora_{i}"] = (_lore(), {"tooltip": "(nessuna) = slot off"})
+            req[f"forza_{i}"] = ("FLOAT", {"default": 1.0, "min": -4.0, "max": 4.0, "step": 0.05,
+                                           "tooltip": "Model weight. 0 = off, negative = opposite effect"})
+        return {"required": req,
+                "optional": {"clip": ("CLIP", {"tooltip": "Optional: connect it and the LoRAs also act on the text encoder"}),
+                             "forza_clip": ("FLOAT", {"default": 1.0, "min": -4.0, "max": 4.0, "step": 0.05,
+                                                      "tooltip": "Single multiplier for the text part"}),
+                             **{f"passa_{i}": (QUALSIASI, {"tooltip": "Pass-through: whatever enters leaves unchanged "
+                                                           "(e.g. the VAE), only to keep the wires tidy"})
+                                for i in range(1, PASSA_MAX + 1)}}}
+
+    RETURN_TYPES = ("MODEL", "CLIP", "STRING") + (QUALSIASI,) * PASSA_MAX
+    RETURN_NAMES = ("model", "clip", "riepilogo") + tuple(f"passa_{i}" for i in range(1, PASSA_MAX + 1))
+    FUNCTION = "applica"
+    CATEGORY = CAT
+    DESCRIPTION = "LoRA stack for AlchemicaKrea: connect its output to the composition model or to the refinement model."
+
+    @classmethod
+    def _carica(cls, path):
+        import comfy.utils
+        mt = os.path.getmtime(path)
+        if cls._cache.get(path, (None,))[0] != mt:
+            try:
+                lora, meta = comfy.utils.load_torch_file(path, safe_load=True, return_metadata=True)
+            except TypeError:
+                lora, meta = comfy.utils.load_torch_file(path, safe_load=True), None
+            cls._cache = {path: (mt, lora, meta)}      # una sola LoRA in cache: la VRAM e' poca
+        return cls._cache[path][1], cls._cache[path][2]
+
+    def applica(self, model, clip=None, forza_clip=1.0, **kw):
+        import comfy.sd
+        import folder_paths
+        usate, mancanti = [], []
+        for i in range(1, SLOT_LORA + 1):
+            nome = kw.get(f"lora_{i}", "(nessuna)")
+            forza = float(kw.get(f"forza_{i}", 0.0))
+            if nome.startswith("(") or forza == 0.0:
+                continue
+            try:
+                path = folder_paths.get_full_path_or_raise("loras", nome)
+            except Exception as e:
+                print(f"[AlchemicaLoraStack] LoRA '{nome}' not found: {e}")
+                mancanti.append(nome)
+                continue
+            lora, meta = self._carica(path)
+            sc = forza * float(forza_clip) if clip is not None else 0.0
+            try:
+                model, clip = comfy.sd.load_lora_for_models(model, clip, lora, forza, sc, lora_metadata=meta)
+            except TypeError:
+                model, clip = comfy.sd.load_lora_for_models(model, clip, lora, forza, sc)
+            usate.append(f"{nome}  x{forza:g}" + (f"  (text x{sc:g})" if clip is not None else ""))
+        # shown inside the 1.1 node (and on the 1.0 'riepilogo' output): one LoRA per line, missing files flagged
+        testo = (f"Active LoRAs ({len(usate)}):\n" + "\n".join(usate)) if usate else "Active LoRAs: none"
+        if mancanti:
+            testo += "\n" + "\n".join(f"NOT FOUND: {m}" for m in mancanti)
+        print("[AlchemicaLoraStack] " + testo)
+        return (model, clip, testo) + tuple(kw.get(f"passa_{i}") for i in range(1, PASSA_MAX + 1))
+
+
+NODE_CLASS_MAPPINGS = {
+    "AlchemicaKrea": AlchemicaKrea,
+    "AlchemicaSampler": AlchemicaSampler,
+    "AlchemicaScheduleOpts": AlchemicaScheduleOpts,
+    "AlchemicaDetailOpts": AlchemicaDetailOpts,
+    "AlchemicaRestartOpts": AlchemicaRestartOpts,
+    "AlchemicaGuidanceOpts": AlchemicaGuidanceOpts,
+    "AlchemicaTwoStageOpts": AlchemicaTwoStageOpts,
+    "AlchemicaSigmas": AlchemicaSigmas,
+    "AlchemicaSamplerObject": AlchemicaSamplerObject,
+    "AlchemicaResolution": AlchemicaResolution,
+    "AlchemicaTaratura": AlchemicaTaratura,
+    "AlchemicaLoraStack": AlchemicaLoraStack,
+}
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "AlchemicaKrea": "⚗ AlchemicaKrea (all-in-one)",
+    "AlchemicaSampler": "⚗ AlchemicaSampler (advanced)",
+    "AlchemicaScheduleOpts": "⚗ Alchemica · Schedule",
+    "AlchemicaDetailOpts": "⚗ Alchemica · Solver & Detail",
+    "AlchemicaRestartOpts": "⚗ Alchemica · Restart",
+    "AlchemicaGuidanceOpts": "⚗ Alchemica · Guidance (CFG)",
+    "AlchemicaTwoStageOpts": "⚗ Alchemica · Two stages",
+    "AlchemicaSigmas": "⚗ Alchemica · Sigmas",
+    "AlchemicaSamplerObject": "⚗ Alchemica · Sampler (SAMPLER)",
+    "AlchemicaResolution": "⚗ Alchemica · Resolution",
+    "AlchemicaTaratura": "⚗ Alchemica · Calibration",
+    "AlchemicaLoraStack": "⚗ Alchemica · LoRA (stack of 6)",
+}

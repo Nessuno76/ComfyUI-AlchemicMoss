@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.vscode/
+*.bak*
+_LOCALE_*.md
+# calibration profiles are personal: only the profile of the public MOSS-Image checkpoint is published
+profili/*
+!profili/moss_image_sft_int8_convrot.json
